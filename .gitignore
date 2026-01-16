@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Raw / dev data (DO NOT COMMIT)
+data/
+src/data/
+src/data/**
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
