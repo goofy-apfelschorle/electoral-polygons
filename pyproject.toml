@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "electoral-polygons"
+version = "0.1.0"
+description = "Build electoral polygons for Bucharest voting sections from RSV-style Excel rules."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE.txt" }
+authors = [{ name = "Sam" }]
+dependencies = [
+  "pandas",
+  "openpyxl",
+  "geopandas",
+  "shapely",
+  "pyproj",
+  "fiona",
+  "requests"
+]
+
+[project.scripts]
+electoral-polygons = "electoral_polygons.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+electoral_polygons = ["assets/*"]
