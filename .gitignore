@@ -16,3 +16,8 @@ src/data/**
 .DS_Store
 Thumbs.db
 .vscode/
+
+# local / generated
+cache/
+bucharest_osm_assets.gdb/
+src/src/

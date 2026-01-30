@@ -163,35 +163,117 @@ def main() -> None:
     grown = cand[cand.intersects(seed_union)].copy()
     print(f"[debug] grown buildings: {len(grown)}")
 
-    # ---- Determine correct side using seed centroid ----
-    divider = seg.buffer(22.0)
-    neigh = pts_union.buffer(350.0)
-    two_sides = neigh.difference(divider)
+    from shapely.affinity import rotate, translate
+    import numpy as np
+    import math
 
-    if two_sides.geom_type == "Polygon":
-        side_poly = two_sides
-    else:
-        polys = list(getattr(two_sides, "geoms", []))
-        seed_centroid = unary_union(seeds.geometry).centroid
-        dists = [seed_centroid.distance(p) for p in polys]
-        side_poly = polys[int(pd.Series(dists).idxmin())]
+    def _line_angle_deg(line: LineString) -> float:
+        coords = np.asarray(line.coords)
+        dx = float(coords[-1, 0] - coords[0, 0])
+        dy = float(coords[-1, 1] - coords[0, 1])
+        return math.degrees(math.atan2(dy, dx))
 
-    grown = grown[grown.intersects(side_poly)].copy()
+    # ---- Determine correct side using SEEDS in a rotated street frame ----
+    origin = seg.centroid
+    ang = _line_angle_deg(seg)
+    rot = -ang
 
-    # ---- Filled polygon from buildings ----
-    fill_m = 14.0
-    poly_buildings = unary_union(grown.geometry).buffer(fill_m).buffer(0)
+    seg_r = rotate(seg, rot, origin=origin, use_radians=False)
+    ry = float(np.mean([c[1] for c in seg_r.coords]))
 
-    # ---- One-side strip to fill missing building footprints ----
-    strip_depth = 25.0
-    strip = seg.buffer(strip_depth).intersection(side_poly).buffer(0)
+    seeds_r = seeds.copy()
+    seeds_r["geometry"] = seeds_r.geometry.map(lambda g: rotate(g, rot, origin=origin, use_radians=False))
+    seeds_r["geometry"] = seeds_r.geometry.map(lambda g: translate(g, yoff=-ry))
 
-    # HARD CLAMP: never let the polygon expand beyond a local neighborhood of the SV points
-    clamp = pts_union.buffer(140.0)  # << main safety valve (meters)
-    poly_buildings = poly_buildings.intersection(clamp).buffer(0)
-    strip = strip.intersection(clamp).buffer(0)
+    # side is decided by seed centroid y sign after rotation (street ~ horizontal, street ~ y=0)
+    seed_y = float(seeds_r.geometry.centroid.y.mean())
+    keep_pos = seed_y >= 0
+    print(f"[debug] side_by_seeds keep_pos={keep_pos} (seed_y_mean={seed_y:.2f})")
 
-    poly = unary_union([poly_buildings, strip]).buffer(0)
+    def _filter_side(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        if gdf.empty:
+            return gdf
+        gr = gdf.copy()
+        gr["geometry"] = gr.geometry.map(lambda g: rotate(g, rot, origin=origin, use_radians=False))
+        gr["geometry"] = gr.geometry.map(lambda g: translate(g, yoff=-ry))
+        cy = gr.geometry.centroid.y
+        mask = (cy >= 0) if keep_pos else (cy <= 0)
+        return gdf.loc[mask.values].copy()
+
+    # Filter candidate corridor buildings to the correct street side
+    cand_side = _filter_side(cand)
+
+    # ---- Restrict to frontage band (avoid grabbing buildings deep behind the street) ----
+    # Use seeds as truth: how far from the street do "correct" buildings sit?
+    seed_d = seeds.geometry.distance(seg)
+    # robust max (avoid one weird outlier)
+    seed_band = float(seed_d.quantile(0.90)) + 12.0  # meters; tweak margin if needed
+    print(f"[debug] seed_band_from_street={seed_band:.1f}m")
+
+    # Measure candidate distance to street
+    cand_side = cand_side.copy()
+    cand_side["d_street"] = cand_side.geometry.distance(seg)
+
+    # Keep only buildings close enough to the street (frontage)
+    cand_front = cand_side[cand_side["d_street"] <= seed_band].copy()
+    print(f"[debug] cand_front buildings: {len(cand_front)} (from {len(cand_side)})")
+    cand_front.to_crs(buildings.crs).to_file(out_gpkg, layer="sv1_cand_front_debug", driver="GPKG")
+    cand_side.to_crs(buildings.crs).to_file(out_gpkg, layer="sv1_cand_side_debug", driver="GPKG")
+    print("[debug] wrote sv1_cand_front_debug and sv1_cand_side_debug")
+    print(f"[debug] cand_side buildings: {len(cand_side)}")
+    print(f"[debug] cand_front buildings: {len(cand_front)}")
+
+
+
+    # Safety fallback if we filtered too hard
+    if cand_front.empty:
+        print("[debug] cand_front empty; falling back to cand_side")
+        cand_front = cand_side
+
+    grown_side = _filter_side(grown)
+
+    print(f"[debug] cand_side buildings: {len(cand_side)}")
+    print(f"[debug] grown_side buildings: {len(grown_side)}")
+
+
+    print(f"[debug] cand_side buildings: {len(cand_side)}")
+
+    from electoral_polygons.polygonize import (
+    OrthogonalFrontageParams,
+    build_orthogonal_frontage_polygon,
+    )
+
+    # ---- Build orthogonal, one-sided frontage polygon ----
+    # Clamp remains your safety valve
+    clamp = pts_union.buffer(350.0)
+    anchor = unary_union(seeds.geometry)  # or pts_union; seeds is usually best
+
+
+    params = OrthogonalFrontageParams(
+        pad_along=10.0,
+        pad_x=12.0,
+        pad_y=15.0,
+        building_buffer=7.0,
+        close_m=22.0,
+        simplify_tol=1.2,
+    )
+    
+    # debug: what geometry are we actually using to build the polygon?
+    cand_front.to_crs(buildings.crs).to_file(out_gpkg, layer="sv1_used_buildings_debug", driver="GPKG")
+
+    seg_gdf = gpd.GeoDataFrame([{"name": "sv1_seg"}], geometry=[seg], crs=work_crs).to_crs(buildings.crs)
+    seg_gdf.to_file(out_gpkg, layer="sv1_seg_debug", driver="GPKG")
+    print("[debug] wrote sv1_used_buildings_debug and sv1_seg_debug")
+
+    anchor=pts_union #for trimming ends
+    poly = build_orthogonal_frontage_polygon(
+        street_seg=seg,
+        buildings=cand_front,
+        anchor_geom=anchor,
+        clamp_poly=clamp,
+        params=params,
+    )
+
 
     # clip to Bucharest boundary
     bnd = unary_union(boundary_w.geometry)
@@ -208,13 +290,14 @@ def main() -> None:
     out = gpd.GeoDataFrame(
         [{
             "sv": 1,
-            "street": "Bulevardul Ion Mihalache",
-            "method": "seed_buildings_plus_strip",
+            "method": "seed_buildings_orthogonal_corridor",
             "frontage_dist": frontage_dist,
             "max_seed_dist": max_seed_dist,
             "grow_m": grow_m,
-            "fill_m": fill_m,
-            "strip_depth": strip_depth,
+            "pad_x": params.pad_x,
+            "pad_y": params.pad_y,
+            "building_buffer": params.building_buffer,
+            "simplify_tol": params.simplify_tol,
         }],
         geometry=[poly],
         crs=work_crs,
